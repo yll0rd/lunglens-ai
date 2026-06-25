@@ -29,8 +29,8 @@ warnings.filterwarnings("ignore")
 # CONFIGURATION
 # =============================================================================
 
-MODEL_DIR = Path(__file__).parent.parent / "nih_outputs" / "mobile_export"
-BONE_SUPPRESSION_MODEL_PATH = Path(__file__).parent.parent / "resnet_bs.h5"
+MODEL_DIR = Path(__file__).parent
+BONE_SUPPRESSION_MODEL_PATH = Path(__file__).parent / "resnet_bs.h5"
 
 DEFAULT_THRESHOLD = 0.5791015625  # Youden threshold from Run B (val_metrics)
 EFFICIENTNET_INPUT_SIZE = 224

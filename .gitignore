@@ -47,12 +47,16 @@ streamlit_errors.txt
 .ipynb_checkpoints
 *.ipynb
 
-# Model files (optional - if too large)
-# Uncomment to ignore model files:
+# Model files (INCLUDED for Streamlit Cloud deployment)
+# nih_outputs/
 # *.onnx
 # *.h5
 # *.pth
 # *.pt
+
+# Exclude checkpoints and large intermediate files
+nih_outputs/*/checkpoints/
+nih_outputs/*/gradcam/
 
 # Data files
 *.npy
@@ -72,3 +76,10 @@ Thumbs.db
 *.tmp
 *.temp
 ~*
+
+# Old directories
+_old_nih_outputs/
+__old_nih_outputs/
+
+# Large media
+*.exe
