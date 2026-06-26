@@ -8,6 +8,7 @@ For research and demonstration only - NOT a diagnostic tool.
 """
 
 import io
+import os
 import warnings
 from pathlib import Path
 from typing import Tuple, Optional
@@ -43,12 +44,12 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225])
 # =============================================================================
 
 @st.cache_resource
-def load_models() -> Tuple[ort.InferenceSession, Optional[object]]:
+def load_models() -> Tuple[ort.InferenceSession, Optional[ort.InferenceSession]]:
     """
     Load ONNX classifier and optional bone suppression model.
 
     Returns:
-        Tuple of (ONNX session, bone suppression model or None)
+        Tuple of (ONNX session, bone suppression ONNX session or None)
     """
     # Load ONNX classifier
     onnx_path = MODEL_DIR / "lunglens_effnet_b0.onnx"
@@ -113,50 +114,67 @@ def preprocess_image(image: Image.Image, target_size: int = EFFICIENTNET_INPUT_S
     return img_array.astype(np.float32)
 
 
-def apply_bone_suppression(image: Image.Image, bone_suppress_model: Optional[object]) -> Image.Image:
+def apply_bone_suppression(image: Image.Image, bone_suppress_model: Optional[ort.InferenceSession], view_orientation: str = "PA") -> Image.Image:
     """
-    Apply bone suppression to chest X-ray image.
+    Apply bone suppression to chest X-ray image using ONNX model.
 
-    If no model is available, returns original image (placeholder function).
+    If no model is available, returns original image (CLAHE fallback).
 
     Args:
         image: PIL Image (original chest X-ray)
-        bone_suppress_model: Loaded bone suppression model or None
+        bone_suppress_model: ONNX InferenceSession or None
+        view_orientation: View position ("PA" or "AP")
 
     Returns:
         Bone-suppressed PIL Image
     """
+    print(bone_suppress_model)
     if bone_suppress_model is None:
-        # Placeholder: simulate bone suppression with histogram equalization
-        # This is a simple approximation and should be replaced with actual model
+        # Fallback: simulate bone suppression with histogram equalization
         img_array = np.array(image.convert('L'), dtype=np.uint8)
-
-        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        # This enhances soft tissue contrast by suppressing high-intensity bone signals
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(img_array)
-
         return Image.fromarray(enhanced, mode='L')
 
     else:
-        # Use actual bone suppression model
+        # Use ONNX bone suppression model
         try:
-            import tensorflow as tf
+            # Resize image to 256x256 as required by ResNet-BS
+            img_resized = image.convert('L').resize((256, 256), Image.Resampling.LANCZOS)
+            img_array = np.array(img_resized, dtype=np.float32) / 255.0
 
-            # Convert PIL to numpy
-            img_array = np.array(image.convert('L'), dtype=np.float32) / 255.0
+            # Add batch and channel dimensions: (1, 256, 256, 1)
+            img_input = np.expand_dims(np.expand_dims(img_array, axis=-1), axis=0).astype(np.float32)
 
-            # Add batch and channel dimensions
-            img_input = np.expand_dims(np.expand_dims(img_array, axis=-1), axis=0)
+            # Get input/output names
+            input_names = [inp.name for inp in bone_suppress_model.get_inputs()]
+            # print(f"Bone suppression model inputs: {input_names}")
+            os.write(1, f"Bone suppression model inputs: {input_names}\n".encode())
+            output_names = [out.name for out in bone_suppress_model.get_outputs()]
+            os.write(1, f"Bone suppression model outputs: {output_names}\n".encode())
+            print(f"Bone suppression model outputs: {output_names}")
 
-            # Predict
-            suppressed = bone_suppress_model.predict(img_input, verbose=0)
+            # Prepare input feed
+            input_feed = {}
+            for inp_name in input_names:
+                if 'image' in inp_name.lower() or inp_name.lower() == 'input':
+                    # First/main input is the image
+                    input_feed[inp_name] = img_input
+                else:
+                    st.warning(f"⚠️ Unmapped input: {inp_name}")
 
-            # Convert back to PIL
+            # Run inference
+            suppressed = bone_suppress_model.run(output_names, input_feed)[0]
+
+            # Convert back to PIL and resize to original
             suppressed = np.squeeze(suppressed) * 255.0
             suppressed = np.clip(suppressed, 0, 255).astype(np.uint8)
+            result_image = Image.fromarray(suppressed, mode='L')
 
-            return Image.fromarray(suppressed, mode='L')
+            # Resize back to original dimensions if needed
+            result_image = result_image.resize(image.size, Image.Resampling.LANCZOS)
+
+            return result_image
 
         except Exception as e:
             st.warning(f"Bone suppression failed: {e}. Using original image.")
@@ -170,7 +188,8 @@ def apply_bone_suppression(image: Image.Image, bone_suppress_model: Optional[obj
 def run_inference(
     preprocessed_image: np.ndarray,
     ort_session: ort.InferenceSession,
-    threshold: float = DEFAULT_THRESHOLD
+    threshold: float = DEFAULT_THRESHOLD,
+    view_orientation: str = "PA"
 ) -> Tuple[float, str, str]:
     """
     Run ONNX inference on preprocessed image.
@@ -179,19 +198,39 @@ def run_inference(
         preprocessed_image: Preprocessed image array (1, 3, 224, 224)
         ort_session: ONNX Runtime session
         threshold: Decision threshold for binary classification
+        view_orientation: View position ("PA" or "AP")
 
     Returns:
         Tuple of (probability_score, class_label, class_name)
     """
-    # Get input/output names
-    input_name = ort_session.get_inputs()[0].name
-    output_name = ort_session.get_outputs()[0].name
+    # Get all input/output names
+    input_names = [inp.name for inp in ort_session.get_inputs()]
+    output_names = [out.name for out in ort_session.get_outputs()]
+
+    # Encode view orientation as metadata (PA=0, AP=1)
+    view_metadata = np.array([[1.0 if view_orientation.upper() == "AP" else 0.0]], dtype=np.float32)
+
+    # Prepare input feed
+    input_feed = {}
+    for inp_name in input_names:
+        if 'image' in inp_name.lower() or inp_name.lower() == 'input':
+            input_feed[inp_name] = preprocessed_image
+        elif 'view' in inp_name.lower() or 'metadata' in inp_name.lower():
+            input_feed[inp_name] = view_metadata
+        else:
+            st.warning(f"⚠️ Unmapped input: {inp_name}")
 
     # Run inference
-    output = ort_session.run([output_name], {input_name: preprocessed_image})
+    output = ort_session.run(output_names, input_feed)
 
     # Extract probability (logits -> softmax -> tumour probability)
-    logits = output[0][0]
+    os.write(1, f"Output type: {type(output)}, length: {len(output)}\n".encode())
+    os.write(1, f"Output[0] shape: {np.array(output[0]).shape}\n".encode())
+    os.write(1, f"Output[0]: {output[0]}\n".encode())
+
+    logits = output[0]
+    if isinstance(logits, np.ndarray) and logits.ndim > 1:
+        logits = logits[0]
 
     # Assuming binary classification: [no_tumour_logit, tumour_logit]
     # Use softmax to convert to probabilities
@@ -414,11 +453,23 @@ def main():
 
     # File uploader
     st.header("📤 Upload Chest X-ray")
-    uploaded_file = st.file_uploader(
-        "Select a chest X-ray image (JPG, PNG)",
-        type=["jpg", "jpeg", "png"],
-        help="Upload a chest radiograph for triage analysis"
-    )
+
+    col_upload, col_view = st.columns([3, 1])
+
+    with col_upload:
+        uploaded_file = st.file_uploader(
+            "Select a chest X-ray image (JPG, PNG)",
+            type=["jpg", "jpeg", "png"],
+            help="Upload a chest radiograph for triage analysis",
+            width='stretch'
+        )
+
+    with col_view:
+        view_orientation = st.selectbox(
+            "View Orientation",
+            ["PA", "AP"],
+            help="Specify whether the X-ray is Posteroanterior (PA) or Anteroposterior (AP) view"
+        )
 
     if uploaded_file is None:
         st.info("👆 Please upload a chest X-ray image to begin analysis.")
@@ -436,29 +487,29 @@ def main():
 
     with col1:
         st.subheader("Original X-ray")
-        st.image(original_image, use_container_width=True, caption="Input image")
+        st.image(original_image, width='stretch', caption=f"Input image ({view_orientation})")
 
     # Run analysis on button click
-    if st.button("🔍 Run LungLens AI Analysis", type="primary", use_container_width=True):
+    if st.button("🔍 Run LungLens AI Analysis", type="primary", width='stretch'):
 
         with st.spinner("🔄 Processing... (bone suppression → inference → Grad-CAM)"):
 
             # Step 1: Bone suppression
             try:
-                bone_suppressed = apply_bone_suppression(original_image, bone_suppress_model)
+                bone_suppressed = apply_bone_suppression(original_image, bone_suppress_model, view_orientation)
             except Exception as e:
                 st.error(f"❌ Bone suppression failed: {e}")
                 st.stop()
 
             with col2:
                 st.subheader("Bone-Suppressed Image")
-                st.image(bone_suppressed, use_container_width=True, caption="After Stage 1 suppression")
+                st.image(bone_suppressed, width='stretch', caption="After Stage 1 suppression")
 
             # Step 2: Preprocess and run inference
             try:
                 preprocessed = preprocess_image(bone_suppressed)
                 tumour_prob, class_label, class_name = run_inference(
-                    preprocessed, ort_session, threshold
+                    preprocessed, ort_session, threshold, view_orientation
                 )
             except Exception as e:
                 st.error(f"❌ Inference failed: {e}")
@@ -478,7 +529,7 @@ def main():
             with col3:
                 if grad_cam_image is not None:
                     st.subheader("Grad-CAM (Model Focus)")
-                    st.image(grad_cam_image, use_container_width=True, caption="Areas of model attention")
+                    st.image(grad_cam_image, width='stretch', caption="Areas of model attention")
                 else:
                     st.warning("Grad-CAM visualization unavailable")
 
