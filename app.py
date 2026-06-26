@@ -255,53 +255,139 @@ def run_inference(
 # GRAD-CAM
 # =============================================================================
 
+class GradCAM:
+    """Gradient-weighted Class Activation Mapping (Selvaraju et al., 2017)."""
+
+    def __init__(self, model: torch.nn.Module, target_layer: torch.nn.Module) -> None:
+        self.model = model
+        self.target_layer = target_layer
+        self._activations: Optional[torch.Tensor] = None
+        self._gradients: Optional[torch.Tensor] = None
+        self._hooks = []
+        self._register_hooks()
+
+    def _register_hooks(self) -> None:
+        self._hooks.append(self.target_layer.register_forward_hook(self._save_activation))
+        self._hooks.append(self.target_layer.register_full_backward_hook(self._save_gradient))
+
+    def _save_activation(self, _module, _inp, out) -> None:  # noqa: ARG002
+        self._activations = out.detach()
+
+    def _save_gradient(self, _module, _grad_in, grad_out) -> None:  # noqa: ARG002
+        self._gradients = grad_out[0].detach()
+
+    def remove_hooks(self) -> None:
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+    def compute(
+        self,
+        image_tensor: torch.Tensor,
+        target_class: int = 1
+    ) -> Optional[np.ndarray]:
+        """Compute the Grad-CAM heatmap for one image."""
+        try:
+            self.model.eval()
+            image_tensor = image_tensor.detach().requires_grad_(True)
+
+            # Forward pass
+            with torch.enable_grad():
+                logit = self.model(image_tensor)
+                self.model.zero_grad()
+
+                # Backward pass for target class
+                if logit.ndim > 1:
+                    score = logit[0, target_class]
+                else:
+                    score = logit[target_class] if len(logit) > target_class else logit[0]
+
+                score.backward()
+
+            # Get captured gradients and activations
+            if self._gradients is None or self._activations is None:
+                return None
+
+            gradients = self._gradients[0]
+            activations = self._activations[0]
+
+            # Compute weights
+            weights = gradients.mean(dim=(1, 2))
+
+            # Weighted combination of activation maps
+            cam = torch.einsum("c,chw->hw", weights, activations)
+            cam = F.relu(cam)
+
+            # Normalize
+            cam_min, cam_max = cam.min(), cam.max()
+            if cam_max > cam_min:
+                cam = (cam - cam_min) / (cam_max - cam_min)
+            else:
+                cam = torch.zeros_like(cam)
+
+            heatmap = cam.cpu().detach().numpy().astype(np.float32)
+            return heatmap
+
+        except Exception as e:
+            st.warning(f"Grad-CAM computation failed: {e}")
+            return None
+
+
+_grad_cam_instance: Optional[GradCAM] = None
+
+
+def get_grad_cam(model: torch.nn.Module) -> GradCAM:
+    """Get or create GradCAM instance with target layer set to last conv layer."""
+    global _grad_cam_instance
+    if _grad_cam_instance is None:
+        # Target the last convolutional layer in EfficientNet-B0
+        target_layer = model.features[-1][0]  # First conv in last block
+        _grad_cam_instance = GradCAM(model, target_layer)
+    return _grad_cam_instance
+
+
+@st.cache_resource
+def load_efficientnet_model() -> torch.nn.Module:
+    """Load pre-trained EfficientNet-B0 for Grad-CAM computation."""
+    model = models.efficientnet_b0(pretrained=True)
+    model.eval()
+    return model
+
+
 def generate_grad_cam(
     preprocessed_image: np.ndarray,
-    ort_session: ort.InferenceSession,
-    target_layer: int = -1
+    view_orientation: str = "PA"
 ) -> Optional[np.ndarray]:
     """
     Generate Grad-CAM heatmap for visualization.
 
-    Loads the ONNX model weights into a PyTorch model to compute gradients,
-    then generates Grad-CAM on the last convolutional layer.
+    Uses PyTorch EfficientNet-B0 with gradient hooks to compute attention.
+    Adapted from dual_stage_xray_pipeline_v2.ipynb.
 
     Args:
         preprocessed_image: Preprocessed image array (1, 3, 224, 224)
-        ort_session: ONNX Runtime session (not used directly)
-        target_layer: Index of target layer
+        view_orientation: View position ("PA" or "AP") - for context
 
     Returns:
         Grad-CAM heatmap as numpy array (224, 224) or None if failed
     """
     try:
-        # Load EfficientNet-B0 with pre-trained weights
-        model = models.efficientnet_b0(pretrained=True)
-        model.eval()
+        # Load model
+        model = load_efficientnet_model()
 
-        # Convert input to tensor
+        # Get or create Grad-CAM instance
+        grad_cam = get_grad_cam(model)
+
+        # Convert to tensor
         input_tensor = torch.tensor(preprocessed_image, dtype=torch.float32)
-        input_tensor.requires_grad = True
 
-        # Forward pass
-        with torch.enable_grad():
-            output = model(input_tensor)
-            tumour_class = 1  # Assume tumour is class 1
-            score = output[0, tumour_class]
+        # Compute Grad-CAM
+        heatmap = grad_cam.compute(input_tensor, target_class=1)
 
-            # Backward pass
-            model.zero_grad()
-            score.backward()
+        if heatmap is None:
+            return None
 
-        # Get gradients from the last conv layer
-        # For EfficientNet-B0, this is model.features[-1]
-        activations = input_tensor.grad.data.abs().mean(dim=1)[0]
-
-        # Normalize heatmap
-        heatmap = activations.numpy()
-        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-
-        # Resize to original image size
+        # Resize to standard size
         heatmap_resized = cv2.resize(heatmap, (EFFICIENTNET_INPUT_SIZE, EFFICIENTNET_INPUT_SIZE))
 
         return heatmap_resized
@@ -517,7 +603,7 @@ def main():
 
             # Step 3: Generate Grad-CAM
             try:
-                heatmap = generate_grad_cam(preprocessed, ort_session)
+                heatmap = generate_grad_cam(preprocessed, view_orientation)
                 if heatmap is not None:
                     grad_cam_image = overlay_grad_cam(bone_suppressed, heatmap, alpha=0.5)
                 else:
