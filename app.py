@@ -59,11 +59,10 @@ def load_models() -> Tuple[ort.InferenceSession, Optional[object]]:
 
     # Try to load bone suppression model
     bone_suppress_model = None
-    if BONE_SUPPRESSION_MODEL_PATH.exists():
+    onnx_bs_path = MODEL_DIR / "resnet_bs.onnx"
+    if onnx_bs_path.exists():
         try:
-            # Lazy import to avoid hard dependency
-            import tensorflow as tf
-            bone_suppress_model = tf.keras.models.load_model(str(BONE_SUPPRESSION_MODEL_PATH))
+            bone_suppress_model = ort.InferenceSession(str(onnx_bs_path), providers=['CPUExecutionProvider'])
         except Exception as e:
             st.warning(f"Could not load bone suppression model: {e}")
 
