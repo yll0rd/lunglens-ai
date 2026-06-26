@@ -631,16 +631,15 @@ def main():
                 st.error(f"❌ Inference failed: {e}")
                 st.stop()
 
-            # Step 3: Generate Grad-CAM
-            try:
-                heatmap = generate_grad_cam(preprocessed, view_orientation)
-                if heatmap is not None:
-                    grad_cam_image = overlay_grad_cam(bone_suppressed, heatmap, alpha=0.5)
-                else:
-                    grad_cam_image = None
-            except Exception as e:
-                st.warning(f"Grad-CAM generation failed: {e}")
-                grad_cam_image = None
+            # Step 3: Generate Grad-CAM only for high-risk cases
+            grad_cam_image = None
+            if tumour_prob >= threshold:
+                try:
+                    heatmap = generate_grad_cam(preprocessed, view_orientation)
+                    if heatmap is not None:
+                        grad_cam_image = overlay_grad_cam(bone_suppressed, heatmap, alpha=0.5)
+                except Exception as e:
+                    st.warning(f"Grad-CAM generation failed: {e}")
 
             with col3:
                 if grad_cam_image is not None:
