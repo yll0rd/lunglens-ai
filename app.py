@@ -18,11 +18,13 @@ import numpy as np
 import onnxruntime as ort
 import streamlit as st
 from PIL import Image
-from threshold_utils import compute_optimal_threshold
 import torch
 import torch.nn.functional as F
 from torchvision import models
 from torchvision.transforms import functional as TF
+import torch
+import torch.nn.functional as F
+from torchvision import models
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -34,22 +36,28 @@ warnings.filterwarnings("ignore")
 MODEL_DIR = Path(__file__).parent
 BONE_SUPPRESSION_MODEL_PATH = Path(__file__).parent / "resnet_bs.h5"
 
-# Load optimal threshold (with specificity constraint: min_spec=70%)
 def _load_threshold() -> float:
-    """Load optimal threshold from config or use default (Youden)."""
+    """Load optimal threshold from config or use default (Youden).
+
+    Threshold computed using specificity-constrained selection (min_spec=70%)
+    from training data. See threshold_utils.compute_optimal_threshold().
+    """
     import json
-    config = compute_optimal_threshold()
-    threshold = config.get("threshold", 0.5791015625)
-    # config_path = MODEL_DIR / "threshold_config.json"
-    # if config_path.exists():
-    #     try:
-    #         with open(config_path) as f:
-    #             config = json.load(f)
-    #         print(f"✅ Loaded threshold from config: {config['threshold']}")
-    #         return float(config['threshold'])
-    #     except Exception as e:
-    #         print(f"⚠️ Failed to load config: {e}. Using Youden threshold.")
-    return threshold  # Fallback: Youden threshold from Run B
+
+    config_path = MODEL_DIR / "threshold_config.json"
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            threshold = float(config.get('threshold', 0.5791015625))
+            print(f"✅ Loaded threshold from config: {threshold}")
+            return threshold
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            print(f"⚠️ Failed to load config ({type(e).__name__}): {e}. Using fallback.")
+
+    fallback_threshold = 0.5791015625
+    print(f"📌 Using fallback threshold: {fallback_threshold}")
+    return fallback_threshold
 
 
 DEFAULT_THRESHOLD = _load_threshold()
@@ -233,33 +241,23 @@ def run_inference(
 
     # Prepare input feed
     input_feed = {}
-    for inp_name in input_names:
-        if 'image' in inp_name.lower() or inp_name.lower() == 'input':
-            input_feed[inp_name] = preprocessed_image
-        elif 'view' in inp_name.lower() or 'metadata' in inp_name.lower():
-            input_feed[inp_name] = view_metadata
-        else:
-            st.warning(f"⚠️ Unmapped input: {inp_name}")
+    input_feed['image'] = preprocessed_image
+    input_feed['view_metadata'] = view_metadata 
+        
 
     # Run inference
     output = ort_session.run(output_names, input_feed)
-
-    # Extract probability (logits -> softmax -> tumour probability)
-    os.write(1, f"Output type: {type(output)}, length: {len(output)}\n".encode())
-    os.write(1, f"Output[0] shape: {np.array(output[0]).shape}\n".encode())
-    os.write(1, f"Output[0]: {output[0]}\n".encode())
 
     logits = output[0]
     if isinstance(logits, np.ndarray) and logits.ndim > 1:
         logits = logits[0]
 
-    # Assuming binary classification: [no_tumour_logit, tumour_logit]
-    # Use softmax to convert to probabilities
-    probs = F.softmax(torch.tensor(logits, dtype=torch.float32), dim=0).numpy()
-    tumour_prob = float(probs[1]) if len(probs) > 1 else float(probs[0])
-
-    # Clamp to [0, 1] just in case
-    tumour_prob = np.clip(tumour_prob, 0.0, 1.0)
+    # Binary classification: use sigmoid (consistent with training)
+    logits_tensor = torch.tensor(logits, dtype=torch.float32)
+    if logits_tensor.ndim == 0:
+        tumour_prob = float(torch.sigmoid(logits_tensor))
+    else:
+        tumour_prob = float(torch.sigmoid(logits_tensor[0]))
 
     # Classify based on threshold
     if tumour_prob >= threshold:
@@ -552,7 +550,6 @@ def main():
             "• **Maximizes detection**: Among valid thresholds, picks highest sensitivity\n"
             "• **Clinically sound**: Prioritizes not flagging healthy patients\n\n"
             "To compute the optimal threshold from your data:\n"
-            "`python compute_optimal_threshold.py`"
         )
 
         st.markdown("---")
