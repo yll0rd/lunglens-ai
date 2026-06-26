@@ -18,6 +18,7 @@ import numpy as np
 import onnxruntime as ort
 import streamlit as st
 from PIL import Image
+from threshold_utils import compute_optimal_threshold
 import torch
 import torch.nn.functional as F
 from torchvision import models
@@ -33,7 +34,27 @@ warnings.filterwarnings("ignore")
 MODEL_DIR = Path(__file__).parent
 BONE_SUPPRESSION_MODEL_PATH = Path(__file__).parent / "resnet_bs.h5"
 
-DEFAULT_THRESHOLD = 0.5791015625  # Youden threshold from Run B (val_metrics)
+# Load optimal threshold (with specificity constraint: min_spec=70%)
+def _load_threshold() -> float:
+    """Load optimal threshold from config or use default (Youden)."""
+    import json
+    config = compute_optimal_threshold()
+    threshold = config.get("threshold", 0.5791015625)
+    # config_path = MODEL_DIR / "threshold_config.json"
+    # if config_path.exists():
+    #     try:
+    #         with open(config_path) as f:
+    #             config = json.load(f)
+    #         print(f"✅ Loaded threshold from config: {config['threshold']}")
+    #         return float(config['threshold'])
+    #     except Exception as e:
+    #         print(f"⚠️ Failed to load config: {e}. Using Youden threshold.")
+    return threshold  # Fallback: Youden threshold from Run B
+
+
+DEFAULT_THRESHOLD = _load_threshold()
+# Note: This threshold uses specificity-constrained selection (min_spec=70%)
+# which is more medically appropriate than pure Youden's Index
 EFFICIENTNET_INPUT_SIZE = 224
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
 IMAGENET_STD = np.array([0.229, 0.224, 0.225])
@@ -520,6 +541,18 @@ def main():
             value=DEFAULT_THRESHOLD,
             step=0.01,
             help="Probability threshold for tumour classification. Higher = stricter (fewer tumours detected)."
+        )
+
+        st.markdown("---")
+        st.info(
+            "**📊 Threshold Selection Strategy**\n\n"
+            "This app uses a **specificity-constrained approach** (min 70% specificity) "
+            "rather than pure Youden's Index. This is more medically appropriate because:\n\n"
+            "• **Avoids false alarms**: Maintains ≥70% specificity\n"
+            "• **Maximizes detection**: Among valid thresholds, picks highest sensitivity\n"
+            "• **Clinically sound**: Prioritizes not flagging healthy patients\n\n"
+            "To compute the optimal threshold from your data:\n"
+            "`python compute_optimal_threshold.py`"
         )
 
         st.markdown("---")
